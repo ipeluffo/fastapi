@@ -56,6 +56,7 @@ from fastapi.concurrency import (
 )
 from fastapi.dependencies.models import (
     Dependant,
+    _CallIdentity,
     _get_cache_key,
     _get_computed_scope,
     _get_oauth_scopes,
@@ -136,12 +137,87 @@ def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> De
     own_oauth_scopes: list[str] = []
     if isinstance(depends, params.Security) and depends.scopes:
         own_oauth_scopes.extend(depends.scopes)
-    return get_dependant(
+    return _get_or_build_sub_dependant(
         path=path,
+        path_param_names=frozenset(get_path_param_names(path)),
         call=depends.dependency,
-        scope=depends.scope,
+        name=None,
         own_oauth_scopes=own_oauth_scopes,
+        parent_oauth_scopes=None,
+        use_cache=True,
+        scope=depends.scope,
     )
+
+
+# Sub-dependant trees and per-callable parameter analysis are reused across
+# routes (and across the effective-route re-builds done for included routers).
+# A cached sub-Dependant is shared by every route that uses the same dependency
+# under the same name, path-parameter names, OAuth2 scopes, `use_cache` flag,
+# and dependency scope, so it must never be mutated after construction. Only
+# root dependants (built through `get_dependant` directly) are safe to mutate,
+# e.g. by `_build_dependant_with_parameterless_dependencies`.
+_SUB_DEPENDANT_CACHE: dict[tuple[Any, ...], Dependant] = {}
+_ANALYZED_PARAMS_CACHE: dict[
+    tuple[_CallIdentity, frozenset[str]], list[tuple[str, "ParamDetails"]]
+] = {}
+
+
+def _get_or_build_sub_dependant(
+    *,
+    path: str,
+    path_param_names: frozenset[str],
+    call: Callable[..., Any],
+    name: str | None,
+    own_oauth_scopes: list[str] | None,
+    parent_oauth_scopes: list[str] | None,
+    use_cache: bool,
+    scope: Literal["function", "request"] | None,
+) -> Dependant:
+    cache_key = (
+        _CallIdentity(call),
+        name,
+        path_param_names,
+        tuple(own_oauth_scopes or []),
+        tuple(parent_oauth_scopes or []),
+        use_cache,
+        scope,
+    )
+    sub_dependant = _SUB_DEPENDANT_CACHE.get(cache_key)
+    if sub_dependant is None:
+        sub_dependant = get_dependant(
+            path=path,
+            call=call,
+            name=name,
+            own_oauth_scopes=own_oauth_scopes,
+            parent_oauth_scopes=parent_oauth_scopes,
+            use_cache=use_cache,
+            scope=scope,
+        )
+        _SUB_DEPENDANT_CACHE[cache_key] = sub_dependant
+    return sub_dependant
+
+
+def _get_analyzed_params(
+    *, call: Callable[..., Any], path_param_names: frozenset[str]
+) -> list[tuple[str, "ParamDetails"]]:
+    cache_key = (_CallIdentity(call), path_param_names)
+    analyzed = _ANALYZED_PARAMS_CACHE.get(cache_key)
+    if analyzed is None:
+        endpoint_signature = get_typed_signature(call)
+        analyzed = [
+            (
+                param_name,
+                analyze_param(
+                    param_name=param_name,
+                    annotation=param.annotation,
+                    value=param.default,
+                    is_path_param=param_name in path_param_names,
+                ),
+            )
+            for param_name, param in endpoint_signature.parameters.items()
+        ]
+        _ANALYZED_PARAMS_CACHE[cache_key] = analyzed
+    return analyzed
 
 
 def _get_flat_body_params(dependant: Dependant) -> list[ModelField]:
@@ -288,17 +364,10 @@ def get_dependant(
         parent_oauth_scopes=parent_oauth_scopes,
     )
     current_scopes = (parent_oauth_scopes or []) + (own_oauth_scopes or [])
-    path_param_names = get_path_param_names(path)
-    endpoint_signature = get_typed_signature(call)
-    signature_params = endpoint_signature.parameters
-    for param_name, param in signature_params.items():
-        is_path_param = param_name in path_param_names
-        param_details = analyze_param(
-            param_name=param_name,
-            annotation=param.annotation,
-            value=param.default,
-            is_path_param=is_path_param,
-        )
+    path_param_names = frozenset(get_path_param_names(path))
+    for param_name, param_details in _get_analyzed_params(
+        call=call, path_param_names=path_param_names
+    ):
         if param_details.depends is not None:
             assert param_details.depends.dependency
             if (
@@ -319,8 +388,9 @@ def get_dependant(
             if isinstance(param_details.depends, params.Security):
                 if param_details.depends.scopes:
                     sub_own_oauth_scopes = list(param_details.depends.scopes)
-            sub_dependant = get_dependant(
+            sub_dependant = _get_or_build_sub_dependant(
                 path=path,
+                path_param_names=path_param_names,
                 call=param_details.depends.dependency,
                 name=param_name,
                 own_oauth_scopes=sub_own_oauth_scopes,
@@ -620,6 +690,18 @@ async def solve_dependencies(
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
         call = sub_dependant.call
         use_sub_dependant = sub_dependant
+        if sub_dependant.use_cache:
+            early_cache_key = _get_cache_key(
+                dependant=sub_dependant,
+                uses_scopes_cache=_uses_scopes_cache,
+            )
+            if early_cache_key in dependency_cache:
+                # The same dependency was already solved for this request (e.g.
+                # it's shared by several dependencies of this route), reuse the
+                # value without solving its own sub-dependencies again.
+                if sub_dependant.name is not None:
+                    values[sub_dependant.name] = dependency_cache[early_cache_key]
+                continue
         if (
             dependency_overrides_provider
             and dependency_overrides_provider.dependency_overrides
