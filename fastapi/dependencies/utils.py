@@ -100,6 +100,18 @@ multipart_incorrect_install_error = (
     "pip install python-multipart\n"
 )
 
+# Sub-dependant trees and per-callable parameter analysis are reused across
+# routes (and across the effective-route re-builds done for included routers).
+# A cached sub-Dependant is shared by every route that uses the same dependency
+# under the same name, path-parameter names, OAuth2 scopes, `use_cache` flag,
+# and dependency scope, so it must never be mutated after construction. Only
+# root dependants (built through `get_dependant` directly) are safe to mutate,
+# e.g. by `_build_dependant_with_parameterless_dependencies`.
+_SUB_DEPENDANT_CACHE: dict[tuple[Any, ...], Dependant] = {}
+_ANALYZED_PARAMS_CACHE: dict[
+    tuple[_CallIdentity, frozenset[str]], list[tuple[str, "ParamDetails"]]
+] = {}
+
 
 def ensure_multipart_is_installed() -> None:
     try:
@@ -137,29 +149,17 @@ def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> De
     own_oauth_scopes: list[str] = []
     if isinstance(depends, params.Security) and depends.scopes:
         own_oauth_scopes.extend(depends.scopes)
+
     return _get_or_build_sub_dependant(
         path=path,
         path_param_names=frozenset(get_path_param_names(path)),
         call=depends.dependency,
-        name=None,
         own_oauth_scopes=own_oauth_scopes,
+        scope=depends.scope,
+        name=None,
         parent_oauth_scopes=None,
         use_cache=True,
-        scope=depends.scope,
     )
-
-
-# Sub-dependant trees and per-callable parameter analysis are reused across
-# routes (and across the effective-route re-builds done for included routers).
-# A cached sub-Dependant is shared by every route that uses the same dependency
-# under the same name, path-parameter names, OAuth2 scopes, `use_cache` flag,
-# and dependency scope, so it must never be mutated after construction. Only
-# root dependants (built through `get_dependant` directly) are safe to mutate,
-# e.g. by `_build_dependant_with_parameterless_dependencies`.
-_SUB_DEPENDANT_CACHE: dict[tuple[Any, ...], Dependant] = {}
-_ANALYZED_PARAMS_CACHE: dict[
-    tuple[_CallIdentity, frozenset[str]], list[tuple[str, "ParamDetails"]]
-] = {}
 
 
 def _get_or_build_sub_dependant(
