@@ -170,8 +170,6 @@ def test_derived_values_follow_dependency_state() -> None:
         parent_oauth_scopes=["parent"],
     )
 
-    assert _get_cache_key(dependant=dependant) == (sync_dependency, (), "")
-
     child.security_scopes_param_name = "scopes"
     dependant.own_oauth_scopes = ["own", "parent"]
 
@@ -182,6 +180,23 @@ def test_derived_values_follow_dependency_state() -> None:
         ("own", "parent"),
         "",
     )
+
+
+def test_cache_key_is_memoized_per_dependant() -> None:
+    # Dependants are only mutated while their route is built, before the cache
+    # key is ever computed, so the key is memoized to avoid recomputing it on
+    # every request
+    dependant = Dependant(
+        call=sync_dependency,
+        own_oauth_scopes=["own"],
+    )
+
+    cache_key = _get_cache_key(dependant=dependant)
+    assert cache_key == (sync_dependency, ("own",), "")
+    assert _get_cache_key(dependant=dependant) is cache_key
+
+    dependant.own_oauth_scopes = ["own", "other"]
+    assert _get_cache_key(dependant=dependant) is cache_key
 
 
 def test_explicit_and_generator_scopes() -> None:

@@ -49,6 +49,10 @@ class Dependant:
     use_cache: bool = True
     path: str | None = None
     scope: Literal["function", "request"] | None = None
+    # Memoized by _get_cache_key()
+    _cache_key: DependencyCacheKey | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
 
 _UsesScopesCache = dict[int, tuple[Dependant, bool]]
@@ -84,16 +88,20 @@ def _get_cache_key(
     dependant: Dependant,
     uses_scopes_cache: _UsesScopesCache | None = None,
 ) -> DependencyCacheKey:
-    scopes_for_cache = (
-        tuple(sorted(set(_get_oauth_scopes(dependant=dependant))))
-        if _uses_scopes(dependant=dependant, cache=uses_scopes_cache)
-        else ()
-    )
-    return (
-        dependant.call,
-        scopes_for_cache,
-        _get_computed_scope(dependant=dependant) or "",
-    )
+    cache_key = dependant._cache_key
+    if cache_key is None:
+        scopes_for_cache = (
+            tuple(sorted(set(_get_oauth_scopes(dependant=dependant))))
+            if _uses_scopes(dependant=dependant, cache=uses_scopes_cache)
+            else ()
+        )
+        cache_key = (
+            dependant.call,
+            scopes_for_cache,
+            _get_computed_scope(dependant=dependant) or "",
+        )
+        dependant._cache_key = cache_key
+    return cache_key
 
 
 def _uses_scopes(
