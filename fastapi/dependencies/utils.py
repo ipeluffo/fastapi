@@ -57,6 +57,7 @@ from fastapi.concurrency import (
 )
 from fastapi.dependencies.models import (
     Dependant,
+    _CallIdentity,
     _get_cache_key,
     _get_computed_scope,
     _get_oauth_scopes,
@@ -141,6 +142,158 @@ def ensure_multipart_is_installed() -> None:
             raise RuntimeError(multipart_not_installed_error) from None
 
 
+# Sub-dependant trees and per-callable parameter analysis are reused across
+# routes (and across the effective-route re-builds done for included routers).
+# A cached sub-Dependant is shared by every route that uses the same dependency
+# under the same name, relevant path-parameter names, OAuth2 scopes,
+# `use_cache` flag, and dependency scope, so it must never be mutated after
+# construction. Only root dependants (built through `get_dependant` directly)
+# are safe to mutate, e.g. by
+# `_build_dependant_with_parameterless_dependencies`.
+#
+# A shared sub-Dependant (and its nested sub-dependants) keeps the `path` of
+# the first route that built it, so its `path` can belong to a route other than
+# the one being served. That is safe: the path only influences the analysis
+# through the path-parameter names, which are part of the cache key, and the
+# only runtime consumer of a sub-dependant's `path` — re-building overridden
+# dependencies in `solve_dependencies` — uses the path of the route being
+# served (threaded through as `_base_path`) instead of the cached one.
+_SUB_DEPENDANT_CACHE: dict[tuple[Any, ...], Dependant] = {}
+_ANALYZED_PARAMS_CACHE: dict[
+    tuple[_CallIdentity, frozenset[str]], list[tuple[str, "ParamDetails"]]
+] = {}
+_SIGNATURE_CACHE: dict[_CallIdentity, tuple[inspect.Signature, frozenset[str]]] = {}
+_SUBTREE_PARAM_NAMES: dict[_CallIdentity, frozenset[str]] = {}
+
+
+def _get_signature_and_param_names(
+    call: Callable[..., Any],
+) -> tuple[inspect.Signature, frozenset[str]]:
+    call_identity = _CallIdentity(call)
+    cached = _SIGNATURE_CACHE.get(call_identity)
+    if cached is not None:
+        return cached
+    endpoint_signature = get_typed_signature(call)
+    names: set[str] = set()
+    for param_name, param in endpoint_signature.parameters.items():
+        names.add(param_name)
+        if isinstance(param.default, FieldInfo) and isinstance(
+            param.default.validation_alias, AliasChoices
+        ):
+            for choice in param.default.validation_alias.choices:
+                if isinstance(choice, str):
+                    names.add(choice)
+        if get_origin(param.annotation) is Annotated:
+            for arg in get_args(param.annotation)[1:]:
+                if isinstance(arg, FieldInfo) and isinstance(
+                    arg.validation_alias, AliasChoices
+                ):
+                    for choice in arg.validation_alias.choices:
+                        if isinstance(choice, str):
+                            names.add(choice)
+    result = (endpoint_signature, frozenset(names))
+    _SIGNATURE_CACHE[call_identity] = result
+    return result
+
+
+def _collect_subtree_param_names(dependant: Dependant, names: set[str]) -> None:
+    if dependant.call is not None:
+        _, own_names = _get_signature_and_param_names(dependant.call)
+        names.update(own_names)
+    for sub_dependant in dependant.dependencies:
+        if sub_dependant.name is not None:
+            names.add(sub_dependant.name)
+        assert sub_dependant.call is not None
+        known_names = _SUBTREE_PARAM_NAMES.get(_CallIdentity(sub_dependant.call))
+        if known_names is not None:
+            names.update(known_names)
+        else:
+            _collect_subtree_param_names(sub_dependant, names)
+
+
+def _get_or_build_sub_dependant(
+    *,
+    path: str,
+    path_param_names: frozenset[str],
+    call: Callable[..., Any],
+    name: str | None,
+    own_oauth_scopes: list[str] | None,
+    parent_oauth_scopes: list[str] | None,
+    use_cache: bool,
+    scope: Literal["function", "request"] | None,
+) -> Dependant:
+    call_identity = _CallIdentity(call)
+    known_param_names = _SUBTREE_PARAM_NAMES.get(call_identity)
+    first_build: Dependant | None = None
+    if known_param_names is None:
+        first_build = get_dependant(
+            path=path,
+            call=call,
+            name=name,
+            own_oauth_scopes=own_oauth_scopes,
+            parent_oauth_scopes=parent_oauth_scopes,
+            use_cache=use_cache,
+            scope=scope,
+        )
+        collected_names: set[str] = set()
+        _collect_subtree_param_names(first_build, collected_names)
+        known_param_names = frozenset(collected_names)
+        _SUBTREE_PARAM_NAMES[call_identity] = known_param_names
+
+    cache_key = (
+        call_identity,
+        name,
+        path_param_names & known_param_names,
+        tuple(own_oauth_scopes or []),
+        tuple(parent_oauth_scopes or []),
+        use_cache,
+        scope,
+    )
+    if first_build is not None:
+        _SUB_DEPENDANT_CACHE[cache_key] = first_build
+        return first_build
+
+    sub_dependant = _SUB_DEPENDANT_CACHE.get(cache_key)
+    if sub_dependant is None:
+        sub_dependant = get_dependant(
+            path=path,
+            call=call,
+            name=name,
+            own_oauth_scopes=own_oauth_scopes,
+            parent_oauth_scopes=parent_oauth_scopes,
+            use_cache=use_cache,
+            scope=scope,
+        )
+        _SUB_DEPENDANT_CACHE[cache_key] = sub_dependant
+    return sub_dependant
+
+
+def _get_analyzed_params(
+    *, call: Callable[..., Any], path_param_names: frozenset[str]
+) -> list[tuple[str, "ParamDetails"]]:
+    call_identity = _CallIdentity(call)
+    endpoint_signature, own_param_names = _get_signature_and_param_names(call)
+    relevant_path_params = path_param_names & own_param_names
+    cache_key = (call_identity, relevant_path_params)
+    analyzed = _ANALYZED_PARAMS_CACHE.get(cache_key)
+    if analyzed is None:
+        relevant_path_params_set = set(relevant_path_params)
+        analyzed = [
+            (
+                param_name,
+                analyze_param(
+                    param_name=param_name,
+                    annotation=param.annotation,
+                    value=param.default,
+                    path_param_names=relevant_path_params_set,
+                ),
+            )
+            for param_name, param in endpoint_signature.parameters.items()
+        ]
+        _ANALYZED_PARAMS_CACHE[cache_key] = analyzed
+    return analyzed
+
+
 def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> Dependant:
     assert callable(depends.dependency), (
         "A parameter-less dependency must have a callable dependency"
@@ -148,11 +301,15 @@ def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> De
     own_oauth_scopes: list[str] = []
     if isinstance(depends, params.Security) and depends.scopes:
         own_oauth_scopes.extend(depends.scopes)
-    return get_dependant(
+    return _get_or_build_sub_dependant(
         path=path,
+        path_param_names=frozenset(get_path_param_names(path)),
         call=depends.dependency,
-        scope=depends.scope,
+        name=None,
         own_oauth_scopes=own_oauth_scopes,
+        parent_oauth_scopes=None,
+        use_cache=True,
+        scope=depends.scope,
     )
 
 
@@ -317,16 +474,10 @@ def get_dependant(
         parent_oauth_scopes=parent_oauth_scopes,
     )
     current_scopes = (parent_oauth_scopes or []) + (own_oauth_scopes or [])
-    path_param_names = get_path_param_names(path)
-    endpoint_signature = get_typed_signature(call)
-    signature_params = endpoint_signature.parameters
-    for param_name, param in signature_params.items():
-        param_details = analyze_param(
-            param_name=param_name,
-            annotation=param.annotation,
-            value=param.default,
-            path_param_names=path_param_names,
-        )
+    path_param_names = frozenset(get_path_param_names(path))
+    for param_name, param_details in _get_analyzed_params(
+        call=call, path_param_names=path_param_names
+    ):
         if param_details.depends is not None:
             assert param_details.depends.dependency
             if (
@@ -347,8 +498,9 @@ def get_dependant(
             if isinstance(param_details.depends, params.Security):
                 if param_details.depends.scopes:
                     sub_own_oauth_scopes = list(param_details.depends.scopes)
-            sub_dependant = get_dependant(
+            sub_dependant = _get_or_build_sub_dependant(
                 path=path,
+                path_param_names=path_param_names,
                 call=param_details.depends.dependency,
                 name=param_name,
                 own_oauth_scopes=sub_own_oauth_scopes,
@@ -654,6 +806,7 @@ async def solve_dependencies(
     async_exit_stack: AsyncExitStack,
     embed_body_fields: bool,
     _uses_scopes_cache: _UsesScopesCache | None = None,
+    _base_path: str | None = None,
 ) -> SolvedDependency:
     request_astack = request.scope.get("fastapi_inner_astack")
     assert isinstance(request_astack, AsyncExitStack), (
@@ -673,6 +826,8 @@ async def solve_dependencies(
         dependency_cache = {}
     if _uses_scopes_cache is None:
         _uses_scopes_cache = {}
+    if _base_path is None:
+        _base_path = dependant.path
     for sub_dependant in dependant.dependencies:
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
         call = sub_dependant.call
@@ -686,6 +841,8 @@ async def solve_dependencies(
                 dependency_overrides_provider, "dependency_overrides", {}
             ).get(original_call, original_call)
             use_path: str = sub_dependant.path  # type: ignore
+            if _base_path is not None:
+                use_path = _base_path
             use_sub_dependant = get_dependant(
                 path=use_path,
                 call=call,
@@ -705,6 +862,7 @@ async def solve_dependencies(
             async_exit_stack=async_exit_stack,
             embed_body_fields=embed_body_fields,
             _uses_scopes_cache=_uses_scopes_cache,
+            _base_path=_base_path,
         )
         background_tasks = solved_result.background_tasks
         if solved_result.errors:

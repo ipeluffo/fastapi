@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator, Callable, Generator
-from typing import Any
+from typing import Annotated, Any
 
+from fastapi import Depends, FastAPI, Path, Query
 from fastapi.dependencies.models import (
     Dependant,
     _get_cache_key,
@@ -16,7 +17,9 @@ from fastapi.dependencies.models import (
     _is_security_scheme,
     _uses_scopes,
 )
+from fastapi.dependencies.utils import get_dependant
 from fastapi.security import APIKeyHeader
+from fastapi.testclient import TestClient
 
 
 def sync_dependency() -> None:
@@ -202,3 +205,62 @@ def test_callable_return_annotations_are_not_used() -> None:
         __hash__ = None
 
     assert not _is_coroutine_callable(CallableWithUnhashableReturn())
+
+
+def test_sub_dependants_and_model_fields_are_shared_across_dag_and_routes() -> None:
+    def leaf_dep(q: Annotated[int, Query()] = 1) -> int:
+        return q  # pragma: no cover
+
+    def left_dep(leaf: int = Depends(leaf_dep)) -> int:
+        return leaf  # pragma: no cover
+
+    def right_dep(leaf: int = Depends(leaf_dep)) -> int:
+        return leaf  # pragma: no cover
+
+    def endpoint(
+        left: int = Depends(left_dep),
+        right: int = Depends(right_dep),
+    ) -> int:
+        return left + right  # pragma: no cover
+
+    dep_route_a = get_dependant(path="/items/{item_id}", call=endpoint)
+    dep_route_b = get_dependant(path="/users/{user_id}", call=endpoint)
+
+    # Both branches in the diamond share the exact same leaf Dependant
+    assert (
+        dep_route_a.dependencies[0].dependencies[0]
+        is (dep_route_a.dependencies[1].dependencies[0])
+    )
+    # Routes with unrelated path parameters share the same sub-Dependant subtrees
+    assert dep_route_a.dependencies[0] is dep_route_b.dependencies[0]
+    assert dep_route_a.dependencies[1] is dep_route_b.dependencies[1]
+    # And share the same ModelField instances
+    assert (
+        dep_route_a.dependencies[0].dependencies[0].query_params[0]
+        is dep_route_b.dependencies[0].dependencies[0].query_params[0]
+    )
+
+
+def test_shared_sub_dependant_override_uses_active_route_path_params() -> None:
+    app = FastAPI()
+
+    def shared_dep() -> str:
+        return "default"  # pragma: no cover
+
+    @app.get("/first/{first_id}")
+    def first_route(val: str = Depends(shared_dep)):
+        return {"val": val}
+
+    @app.get("/second/{second_id}")
+    def second_route(val: str = Depends(shared_dep)):
+        return {"val": val}
+
+    def override_dep(second_id: Annotated[str, Path()]) -> str:
+        return f"overridden:{second_id}"
+
+    app.dependency_overrides[shared_dep] = override_dep
+
+    client = TestClient(app)
+    resp = client.get("/second/abc")
+    assert resp.status_code == 200
+    assert resp.json() == {"val": "overridden:abc"}
