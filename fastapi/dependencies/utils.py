@@ -158,9 +158,18 @@ def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> De
 
 def _get_flat_body_params(dependant: Dependant) -> list[ModelField]:
     body_params: list[ModelField] = []
+    visited: list[DependencyCacheKey] = []
+    uses_scopes_cache: _UsesScopesCache = {}
     dependants = [dependant]
     while dependants:
         current_dependant = dependants.pop()
+        cache_key = _get_cache_key(
+            dependant=current_dependant,
+            uses_scopes_cache=uses_scopes_cache,
+        )
+        if cache_key in visited:
+            continue
+        visited.append(cache_key)
         body_params.extend(current_dependant.body_params)
         dependants.extend(reversed(current_dependant.dependencies))
     return body_params

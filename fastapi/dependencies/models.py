@@ -86,7 +86,8 @@ def _get_cache_key(
 ) -> DependencyCacheKey:
     scopes_for_cache = (
         tuple(sorted(set(_get_oauth_scopes(dependant=dependant))))
-        if _uses_scopes(dependant=dependant, cache=uses_scopes_cache)
+        if (dependant.own_oauth_scopes or dependant.parent_oauth_scopes)
+        and _uses_scopes(dependant=dependant, cache=uses_scopes_cache)
         else ()
     )
     return (
