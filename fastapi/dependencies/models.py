@@ -1,6 +1,6 @@
 import inspect
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Literal
@@ -52,6 +52,7 @@ class Dependant:
 
 
 _UsesScopesCache = dict[int, tuple[Dependant, bool]]
+_SubtreeCacheableCache = dict[tuple["_CallIdentity | int", bool], bool]
 _CALLABLE_CLASSIFICATION_CACHE_SIZE = 4096
 
 
@@ -117,6 +118,38 @@ def _uses_scopes(
             for sub_dep in dependant.dependencies
         )
     cache[cache_key] = (dependant, result)
+    return result
+
+
+def _is_subtree_cacheable(
+    *,
+    dependant: Dependant,
+    dependency_overrides: Mapping[Callable[..., Any], Callable[..., Any]] | None = None,
+    cache: _SubtreeCacheableCache | None = None,
+) -> bool:
+    if cache is None:
+        cache = {}
+    cache_key: tuple[_CallIdentity | int, bool] = (
+        _CallIdentity(dependant.call) if dependant.call is not None else id(dependant),
+        dependant.use_cache,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if not dependant.use_cache:
+        result = False
+    elif dependency_overrides and dependant.call in dependency_overrides:
+        result = False
+    else:
+        result = all(
+            _is_subtree_cacheable(
+                dependant=sub_dep,
+                dependency_overrides=dependency_overrides,
+                cache=cache,
+            )
+            for sub_dep in dependant.dependencies
+        )
+    cache[cache_key] = result
     return result
 
 

@@ -63,6 +63,8 @@ from fastapi.dependencies.models import (
     _is_async_gen_callable,
     _is_coroutine_callable,
     _is_gen_callable,
+    _is_subtree_cacheable,
+    _SubtreeCacheableCache,
     _UsesScopesCache,
 )
 from fastapi.exceptions import DependencyScopeError
@@ -654,6 +656,7 @@ async def solve_dependencies(
     async_exit_stack: AsyncExitStack,
     embed_body_fields: bool,
     _uses_scopes_cache: _UsesScopesCache | None = None,
+    _subtree_cacheable_cache: _SubtreeCacheableCache | None = None,
 ) -> SolvedDependency:
     request_astack = request.scope.get("fastapi_inner_astack")
     assert isinstance(request_astack, AsyncExitStack), (
@@ -673,10 +676,33 @@ async def solve_dependencies(
         dependency_cache = {}
     if _uses_scopes_cache is None:
         _uses_scopes_cache = {}
+    if _subtree_cacheable_cache is None:
+        _subtree_cacheable_cache = {}
+    dependency_overrides = (
+        getattr(dependency_overrides_provider, "dependency_overrides", None)
+        if dependency_overrides_provider
+        else None
+    )
     for sub_dependant in dependant.dependencies:
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
         call = sub_dependant.call
         use_sub_dependant = sub_dependant
+        sub_dependant_cache_key = _get_cache_key(
+            dependant=sub_dependant,
+            uses_scopes_cache=_uses_scopes_cache,
+        )
+        if (
+            sub_dependant.use_cache
+            and sub_dependant_cache_key in dependency_cache
+            and _is_subtree_cacheable(
+                dependant=sub_dependant,
+                dependency_overrides=dependency_overrides,
+                cache=_subtree_cacheable_cache,
+            )
+        ):
+            if sub_dependant.name is not None:
+                values[sub_dependant.name] = dependency_cache[sub_dependant_cache_key]
+            continue
         if (
             dependency_overrides_provider
             and dependency_overrides_provider.dependency_overrides
@@ -705,15 +731,12 @@ async def solve_dependencies(
             async_exit_stack=async_exit_stack,
             embed_body_fields=embed_body_fields,
             _uses_scopes_cache=_uses_scopes_cache,
+            _subtree_cacheable_cache=_subtree_cacheable_cache,
         )
         background_tasks = solved_result.background_tasks
         if solved_result.errors:
             errors.extend(solved_result.errors)
             continue
-        sub_dependant_cache_key = _get_cache_key(
-            dependant=sub_dependant,
-            uses_scopes_cache=_uses_scopes_cache,
-        )
         if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
             solved = dependency_cache[sub_dependant_cache_key]
         elif _is_gen_callable(use_sub_dependant.call) or _is_async_gen_callable(
