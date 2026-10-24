@@ -52,6 +52,7 @@ class Dependant:
 
 
 _UsesScopesCache = dict[int, tuple[Dependant, bool]]
+_HashableCacheKey = tuple["_CallIdentity | None", tuple[str, ...], str]
 _CALLABLE_CLASSIFICATION_CACHE_SIZE = 4096
 
 
@@ -86,13 +87,30 @@ def _get_cache_key(
 ) -> DependencyCacheKey:
     scopes_for_cache = (
         tuple(sorted(set(_get_oauth_scopes(dependant=dependant))))
-        if _uses_scopes(dependant=dependant, cache=uses_scopes_cache)
+        if (dependant.own_oauth_scopes or dependant.parent_oauth_scopes)
+        and _uses_scopes(dependant=dependant, cache=uses_scopes_cache)
         else ()
     )
     return (
         dependant.call,
         scopes_for_cache,
         _get_computed_scope(dependant=dependant) or "",
+    )
+
+
+def _get_hashable_cache_key(
+    *,
+    dependant: Dependant,
+    uses_scopes_cache: _UsesScopesCache | None = None,
+) -> _HashableCacheKey:
+    call, scopes_for_cache, computed_scope = _get_cache_key(
+        dependant=dependant,
+        uses_scopes_cache=uses_scopes_cache,
+    )
+    return (
+        _CallIdentity(call) if call is not None else None,
+        scopes_for_cache,
+        computed_scope,
     )
 
 

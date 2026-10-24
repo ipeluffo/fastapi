@@ -59,7 +59,9 @@ from fastapi.dependencies.models import (
     Dependant,
     _get_cache_key,
     _get_computed_scope,
+    _get_hashable_cache_key,
     _get_oauth_scopes,
+    _HashableCacheKey,
     _is_async_gen_callable,
     _is_coroutine_callable,
     _is_gen_callable,
@@ -158,9 +160,18 @@ def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> De
 
 def _get_flat_body_params(dependant: Dependant) -> list[ModelField]:
     body_params: list[ModelField] = []
+    visited: set[_HashableCacheKey] = set()
+    uses_scopes_cache: _UsesScopesCache = {}
     dependants = [dependant]
     while dependants:
         current_dependant = dependants.pop()
+        cache_key = _get_hashable_cache_key(
+            dependant=current_dependant,
+            uses_scopes_cache=uses_scopes_cache,
+        )
+        if cache_key in visited:
+            continue
+        visited.add(cache_key)
         body_params.extend(current_dependant.body_params)
         dependants.extend(reversed(current_dependant.dependencies))
     return body_params
@@ -200,18 +211,18 @@ def get_flat_params(dependant: Dependant) -> list[ModelField]:
     query_params: list[ModelField] = []
     header_params: list[ModelField] = []
     cookie_params: list[ModelField] = []
-    visited: list[DependencyCacheKey] = []
+    visited: set[_HashableCacheKey] = set()
     uses_scopes_cache: _UsesScopesCache = {}
     dependants = [dependant]
     while dependants:
         current_dependant = dependants.pop()
-        cache_key = _get_cache_key(
+        cache_key = _get_hashable_cache_key(
             dependant=current_dependant,
             uses_scopes_cache=uses_scopes_cache,
         )
         if cache_key in visited:
             continue
-        visited.append(cache_key)
+        visited.add(cache_key)
         path_params.extend(current_dependant.path_params)
         query_params.extend(current_dependant.query_params)
         header_params.extend(current_dependant.header_params)
