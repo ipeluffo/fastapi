@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator, Callable, Generator
-from typing import Any
+from typing import Annotated, Any
 
+from fastapi import Body, Depends, Query
 from fastapi.dependencies.models import (
     Dependant,
     _get_cache_key,
@@ -16,6 +17,12 @@ from fastapi.dependencies.models import (
     _is_security_scheme,
     _uses_scopes,
 )
+from fastapi.dependencies.utils import (
+    _get_flat_body_params,
+    get_dependant,
+    get_flat_params,
+)
+from fastapi.openapi.utils import _get_openapi_dependency_data
 from fastapi.security import APIKeyHeader
 
 
@@ -202,3 +209,56 @@ def test_callable_return_annotations_are_not_used() -> None:
         __hash__ = None
 
     assert not _is_coroutine_callable(CallableWithUnhashableReturn())
+
+
+def test_flat_body_params_deduplicates_diamond_dependencies() -> None:
+    def shared_body_dep(item: Annotated[int, Body()] = 1) -> int:
+        return item  # pragma: no cover
+
+    def left_dep(val: int = Depends(shared_body_dep)) -> int:
+        return val  # pragma: no cover
+
+    def right_dep(val: int = Depends(shared_body_dep)) -> int:
+        return val  # pragma: no cover
+
+    def endpoint(
+        left: int = Depends(left_dep),
+        right: int = Depends(right_dep),
+    ) -> int:
+        return left + right  # pragma: no cover
+
+    dependant = get_dependant(path="/items", call=endpoint)
+    body_params = _get_flat_body_params(dependant)
+    assert len(body_params) == 1
+    assert body_params[0].name == "item"
+
+
+def test_graph_traversal_supports_unhashable_callables() -> None:
+    class UnhashableBodyAndQueryCallable:
+        __hash__ = None
+
+        def __call__(
+            self,
+            q: Annotated[int, Query()] = 1,
+            b: Annotated[int, Body()] = 2,
+        ) -> int:
+            return q + b  # pragma: no cover
+
+    unhashable_dep = UnhashableBodyAndQueryCallable()
+
+    def left_dep(val: int = Depends(unhashable_dep)) -> int:
+        return val  # pragma: no cover
+
+    def right_dep(val: int = Depends(unhashable_dep)) -> int:
+        return val  # pragma: no cover
+
+    def endpoint(
+        left: int = Depends(left_dep),
+        right: int = Depends(right_dep),
+    ) -> int:
+        return left + right  # pragma: no cover
+
+    dependant = get_dependant(path="/items", call=endpoint)
+    assert len(_get_flat_body_params(dependant)) == 1
+    assert len(get_flat_params(dependant)) == 1
+    assert len(_get_openapi_dependency_data(dependant).query_params) == 1

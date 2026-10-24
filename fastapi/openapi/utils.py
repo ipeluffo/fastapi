@@ -18,9 +18,10 @@ from fastapi._compat import (
 from fastapi.datastructures import DefaultPlaceholder, _Unset
 from fastapi.dependencies.models import (
     Dependant,
-    _get_cache_key,
+    _get_hashable_cache_key,
     _get_oauth_scopes,
     _get_security_scheme,
+    _HashableCacheKey,
     _is_security_scheme,
     _UsesScopesCache,
 )
@@ -37,7 +38,7 @@ from fastapi.openapi.models import OpenAPI
 from fastapi.params import Body, ParamTypes
 from fastapi.responses import Response
 from fastapi.sse import _SSE_EVENT_SCHEMA
-from fastapi.types import DependencyCacheKey, ModelNameMap
+from fastapi.types import ModelNameMap
 from fastapi.utils import (
     deep_dict_update,
     generate_operation_id_for_path,
@@ -98,18 +99,18 @@ class _OpenAPIDependencyData:
 
 def _get_openapi_dependency_data(dependant: Dependant) -> _OpenAPIDependencyData:
     dependency_data = _OpenAPIDependencyData()
-    visited: list[DependencyCacheKey] = []
+    visited: set[_HashableCacheKey] = set()
     uses_scopes_cache: _UsesScopesCache = {}
     dependants: list[tuple[Dependant, list[str], bool]] = [(dependant, [], True)]
     while dependants:
         current_dependant, parent_oauth_scopes, is_root = dependants.pop()
-        cache_key = _get_cache_key(
+        cache_key = _get_hashable_cache_key(
             dependant=current_dependant,
             uses_scopes_cache=uses_scopes_cache,
         )
         if cache_key in visited:
             continue
-        visited.append(cache_key)
+        visited.add(cache_key)
         dependency_data.path_params.extend(current_dependant.path_params)
         dependency_data.query_params.extend(current_dependant.query_params)
         dependency_data.header_params.extend(current_dependant.header_params)
