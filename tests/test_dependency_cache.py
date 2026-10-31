@@ -1,4 +1,5 @@
 from fastapi import Depends, FastAPI, Security
+from fastapi.dependencies import utils as dependency_utils
 from fastapi.testclient import TestClient
 
 app = FastAPI()
@@ -89,3 +90,35 @@ def test_security_cache():
     response = client.get("/scope-counter/")
     assert response.status_code == 200, response.text
     assert response.json() == {"counter": 3, "scope_counter_1": 4, "scope_counter_2": 4}
+
+
+def test_unrelated_dependency_override_does_not_rebuild_dependant(monkeypatch):
+    local_app = FastAPI()
+
+    def unrelated_dep() -> str:
+        return "unrelated"  # pragma: no cover
+
+    def target_dep() -> str:
+        return "target"
+
+    @local_app.get("/override-check")
+    def endpoint(val: str = Depends(target_dep)):
+        return {"val": val}
+
+    local_app.dependency_overrides[unrelated_dep] = lambda: "overridden"
+
+    get_dependant_calls = 0
+    original_get_dependant = dependency_utils.get_dependant
+
+    def counting_get_dependant(*args, **kwargs):
+        nonlocal get_dependant_calls
+        get_dependant_calls += 1
+        return original_get_dependant(*args, **kwargs)
+
+    monkeypatch.setattr(dependency_utils, "get_dependant", counting_get_dependant)
+
+    local_client = TestClient(local_app)
+    response = local_client.get("/override-check")
+    assert response.status_code == 200
+    assert response.json() == {"val": "target"}
+    assert get_dependant_calls == 0
