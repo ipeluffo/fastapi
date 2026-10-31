@@ -1,5 +1,7 @@
 import pytest
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Security
+from fastapi.dependencies import utils as dependency_utils
+from fastapi.security import SecurityScopes
 from fastapi.testclient import TestClient
 
 app = FastAPI()
@@ -387,3 +389,73 @@ def test_override_with_sub_router_decorator_depends_k_bar():
     assert response.status_code == 200
     assert response.json() == {"in": "router-decorator-depends"}
     app.dependency_overrides = {}
+
+
+def test_dependency_override_only_rebuilds_overridden_dependant(monkeypatch):
+    local_app = FastAPI()
+
+    def overridden_dep() -> str:
+        return "original"  # pragma: no cover
+
+    def target_dep() -> str:
+        return "target"
+
+    @local_app.get("/not-overridden")
+    def not_overridden(val: str = Depends(target_dep)):
+        return {"val": val}
+
+    @local_app.get("/overridden")
+    def overridden(val: str = Depends(overridden_dep)):
+        return {"val": val}
+
+    local_app.dependency_overrides[overridden_dep] = lambda: "overridden"
+
+    get_dependant_calls = 0
+    original_get_dependant = dependency_utils.get_dependant
+
+    def counting_get_dependant(*args, **kwargs):
+        nonlocal get_dependant_calls
+        get_dependant_calls += 1
+        return original_get_dependant(*args, **kwargs)
+
+    monkeypatch.setattr(dependency_utils, "get_dependant", counting_get_dependant)
+
+    local_client = TestClient(local_app)
+    response = local_client.get("/not-overridden")
+    assert response.status_code == 200
+    assert response.json() == {"val": "target"}
+    assert get_dependant_calls == 0
+
+    response = local_client.get("/overridden")
+    assert response.status_code == 200
+    assert response.json() == {"val": "overridden"}
+    assert get_dependant_calls == 1
+
+
+def test_unrelated_dependency_override_does_not_change_security_scopes():
+    local_app = FastAPI()
+
+    def unrelated_dep() -> str:
+        return "unrelated"  # pragma: no cover
+
+    def child(security_scopes: SecurityScopes) -> list[str]:
+        return security_scopes.scopes
+
+    def parent(scopes: list[str] = Depends(child)) -> list[str]:
+        return scopes
+
+    def grandparent(scopes: list[str] = Security(parent, scopes=["a"])) -> list[str]:
+        return scopes
+
+    @local_app.get("/scopes")
+    def endpoint(scopes: list[str] = Security(grandparent, scopes=["a"])):
+        return scopes
+
+    local_client = TestClient(local_app)
+    response = local_client.get("/scopes")
+    assert response.status_code == 200, response.text
+
+    local_app.dependency_overrides[unrelated_dep] = lambda: "overridden"
+    overridden_response = local_client.get("/scopes")
+    assert overridden_response.status_code == 200, overridden_response.text
+    assert overridden_response.json() == response.json()

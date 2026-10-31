@@ -673,28 +673,25 @@ async def solve_dependencies(
         dependency_cache = {}
     if _uses_scopes_cache is None:
         _uses_scopes_cache = {}
+    dependency_overrides = (
+        dependency_overrides_provider.dependency_overrides
+        if dependency_overrides_provider
+        else None
+    )
     for sub_dependant in dependant.dependencies:
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
         call = sub_dependant.call
         use_sub_dependant = sub_dependant
-        if (
-            dependency_overrides_provider
-            and dependency_overrides_provider.dependency_overrides
-        ):
-            original_call = sub_dependant.call
-            override_call = getattr(
-                dependency_overrides_provider, "dependency_overrides", {}
-            ).get(original_call)
-            if override_call is not None:
-                call = override_call
-                use_path: str = sub_dependant.path  # type: ignore
-                use_sub_dependant = get_dependant(
-                    path=use_path,
-                    call=call,
-                    name=sub_dependant.name,
-                    parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
-                    scope=sub_dependant.scope,
-                )
+        if dependency_overrides and sub_dependant.call in dependency_overrides:
+            call = dependency_overrides[sub_dependant.call]
+            use_path: str = sub_dependant.path  # type: ignore
+            use_sub_dependant = get_dependant(
+                path=use_path,
+                call=call,
+                name=sub_dependant.name,
+                parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
+                scope=sub_dependant.scope,
+            )
 
         solved_result = await solve_dependencies(
             request=request,
@@ -737,33 +734,26 @@ async def solve_dependencies(
             values[sub_dependant.name] = solved
         if sub_dependant_cache_key not in dependency_cache:
             dependency_cache[sub_dependant_cache_key] = solved
-    if dependant.path_params:
-        path_values, path_errors = request_params_to_args(
-            dependant.path_params, request.path_params
-        )
-        values.update(path_values)
-        errors.extend(path_errors)
-    if dependant.query_params:
-        query_values, query_errors = request_params_to_args(
-            dependant.query_params,
-            request.query_params,
-        )
-        values.update(query_values)
-        errors.extend(query_errors)
-    if dependant.header_params:
-        header_values, header_errors = request_params_to_args(
-            dependant.header_params,
-            request.headers,
-        )
-        values.update(header_values)
-        errors.extend(header_errors)
-    if dependant.cookie_params:
-        cookie_values, cookie_errors = request_params_to_args(
-            dependant.cookie_params,
-            request.cookies,
-        )
-        values.update(cookie_values)
-        errors.extend(cookie_errors)
+    path_values, path_errors = request_params_to_args(
+        dependant.path_params, request.path_params
+    )
+    query_values, query_errors = request_params_to_args(
+        dependant.query_params,
+        request.query_params,
+    )
+    header_values, header_errors = request_params_to_args(
+        dependant.header_params,
+        request.headers,
+    )
+    cookie_values, cookie_errors = request_params_to_args(
+        dependant.cookie_params,
+        request.cookies,
+    )
+    values.update(path_values)
+    values.update(query_values)
+    values.update(header_values)
+    values.update(cookie_values)
+    errors += path_errors + query_errors + header_errors + cookie_errors
     if dependant.body_params:
         (
             body_values,
