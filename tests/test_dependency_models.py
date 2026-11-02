@@ -1,6 +1,8 @@
 from collections.abc import AsyncGenerator, Callable, Generator
-from typing import Any
+from typing import Annotated, Any
 
+from fastapi import Body, Depends
+from fastapi.dependencies import models as dependency_models
 from fastapi.dependencies.models import (
     Dependant,
     _get_cache_key,
@@ -15,6 +17,10 @@ from fastapi.dependencies.models import (
     _is_gen_callable_cached,
     _is_security_scheme,
     _uses_scopes,
+)
+from fastapi.dependencies.utils import (
+    _get_flat_body_params,
+    get_dependant,
 )
 from fastapi.security import APIKeyHeader
 
@@ -202,3 +208,62 @@ def test_callable_return_annotations_are_not_used() -> None:
         __hash__ = None
 
     assert not _is_coroutine_callable(CallableWithUnhashableReturn())
+
+
+def test_flat_body_params_deduplicates_diamond_dependencies() -> None:
+    def shared_body_dep(item: Annotated[int, Body()] = 1) -> int:
+        return item  # pragma: no cover
+
+    def left_dep(val: int = Depends(shared_body_dep)) -> int:
+        return val  # pragma: no cover
+
+    def right_dep(val: int = Depends(shared_body_dep)) -> int:
+        return val  # pragma: no cover
+
+    def endpoint(
+        left: int = Depends(left_dep),
+        right: int = Depends(right_dep),
+    ) -> int:
+        return left + right  # pragma: no cover
+
+    dependant = get_dependant(path="/items", call=endpoint)
+    body_params = _get_flat_body_params(dependant)
+    assert len(body_params) == 1
+    assert body_params[0].name == "item"
+
+
+def test_get_cache_key_skips_uses_scopes_when_no_oauth_scopes(monkeypatch) -> None:
+    uses_scopes_calls = 0
+    original_uses_scopes = dependency_models._uses_scopes
+
+    def counting_uses_scopes(*args, **kwargs):
+        nonlocal uses_scopes_calls
+        uses_scopes_calls += 1
+        return original_uses_scopes(*args, **kwargs)
+
+    monkeypatch.setattr(dependency_models, "_uses_scopes", counting_uses_scopes)
+
+    dependant = Dependant(call=sync_dependency)
+    assert _get_cache_key(dependant=dependant) == (sync_dependency, (), "")
+    assert uses_scopes_calls == 0
+
+    child = Dependant(
+        call=sync_dependency,
+        parent_oauth_scopes=["read"],
+        security_scopes_param_name="scopes",
+    )
+    scoped_dependant = Dependant(
+        call=sync_dependency,
+        dependencies=[child],
+        parent_oauth_scopes=["read"],
+    )
+    uses_scopes_cache: dict[int, tuple[Dependant, bool]] = {}
+    assert _get_cache_key(
+        dependant=scoped_dependant, uses_scopes_cache=uses_scopes_cache
+    ) == (sync_dependency, ("read",), "")
+    assert _get_cache_key(dependant=child, uses_scopes_cache=uses_scopes_cache) == (
+        sync_dependency,
+        ("read",),
+        "",
+    )
+    assert uses_scopes_calls == 3
